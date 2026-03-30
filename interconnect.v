@@ -1,7 +1,3 @@
-// ============================================================
-// File    : i2c_to_axi4lite.v  (FINAL v4 - CLEAN AND CORRECT)
-// ============================================================
-
 `timescale 1ns / 1ps
 
 module i2c_to_axi4lite #(
@@ -53,22 +49,22 @@ module i2c_to_axi4lite #(
     // States
     localparam [4:0]
         IDLE     = 0,
-        START1   = 1,   // SDA↓ SCL=1
-        START2   = 2,   // SCL↓, load byte
+        START1   = 1,   // SDA SCL=1
+        START2   = 2,   // SCL, load byte
         TX_LO    = 3,   // SCL=0, put bit on SDA
         TX_HI    = 4,   // SCL=1, hold (slave samples)
-        TX_NEXT  = 5,   // SCL=1→0, advance to next bit or ACK
+        TX_NEXT  = 5,   // SCL=1->0, advance to next bit or ACK
         ACK_LO   = 6,   // SCL=0, release SDA
         ACK_HI   = 7,   // SCL=1, sample ACK
-        ACK_NEXT = 8,   // SCL=1→0, decide what's next
+        ACK_NEXT = 8,   // SCL=1->0, decide what's next
         RX_LO    = 9,   // SCL=0, slave drives SDA
         RX_HI    = 10,  // SCL=1, sample bit
-        RX_NEXT  = 11,  // SCL=1→0, advance
+        RX_NEXT  = 11,  // SCL=1->0, advance
         NACK_LO  = 12,  // SCL=0, SDA=1
         NACK_HI  = 13,  // SCL=1
         STOP1    = 14,  // SCL=0, SDA=0
         STOP2    = 15,  // SCL=1, SDA=0
-        STOP3    = 16,  // SDA↑ = STOP
+        STOP3    = 16,  // SDA = STOP
         DONEST   = 17;
 
     reg [4:0]  st;
@@ -109,7 +105,7 @@ module i2c_to_axi4lite #(
                     end
                 end
 
-                // ---- START ----
+                // START 
                 START1: if (tick) begin
                     scl <= 1; sda_o <= 0; sda_oe <= 1;  // SDA falls
                     st <= START2;
@@ -123,13 +119,8 @@ module i2c_to_axi4lite #(
                     st   <= TX_LO;
                 end
 
-                // ---- TRANSMIT BIT ----
-                // TX_LO:   SCL is already 0 (set by previous state)
-                //          Drive SDA with txr[bidx]
-                //          (We use txr[7] and shift after each bit)
+                // TRANSMIT BIT 
                 TX_LO: if (tick) begin
-                    // SCL stays 0 (already low)
-                    // But we need to KEEP scl=0 explicitly
                     scl    <= 0;
                     sda_o  <= txr[7];
                     sda_oe <= 1;
@@ -143,11 +134,10 @@ module i2c_to_axi4lite #(
                 end
 
                 // TX_NEXT: SCL has been high for one HALF. Now pull low.
-                //          Advance bit counter.
                 TX_NEXT: if (tick) begin
                     scl <= 0;
                     if (bidx == 0) begin
-                        // All 8 bits sent, go to ACK
+                        // All 8 bits sent,so go to ACK
                         st <= ACK_LO;
                     end else begin
                         txr  <= {txr[6:0], 1'b0};
@@ -176,7 +166,7 @@ module i2c_to_axi4lite #(
                         reg_nack <= 1;
                         st <= STOP1;
                     end else if (!adone) begin
-                        // Address ACK, go to data
+                        // Address ACK, so go to data
                         adone <= 1;
                         bidx  <= 4'd7;
                         if (reg_rw) begin
@@ -192,7 +182,7 @@ module i2c_to_axi4lite #(
                     end
                 end
 
-                // ---- RECEIVE BIT ----
+                // RECEIVE BIT 
                 RX_LO: if (tick) begin
                     scl    <= 0;
                     sda_oe <= 0;
@@ -217,7 +207,7 @@ module i2c_to_axi4lite #(
                     end
                 end
 
-                // ---- MASTER NACK ----
+                // MASTER NACK 
                 NACK_LO: if (tick) begin
                     scl    <= 0;
                     sda_o  <= 1;   // NACK = high
@@ -230,7 +220,7 @@ module i2c_to_axi4lite #(
                     st  <= STOP1;
                 end
 
-                // ---- STOP ----
+                // STOP 
                 STOP1: if (tick) begin
                     scl    <= 0;
                     sda_o  <= 0;
@@ -261,9 +251,8 @@ module i2c_to_axi4lite #(
         end
     end
 
-    // ============================================================
     // AXI Write
-    // ============================================================
+
     reg [4:0] awl;
     always @(posedge clk or negedge rst_n) begin
         if (!rst_n) begin
@@ -291,10 +280,8 @@ module i2c_to_axi4lite #(
             end else if (s_bvalid && s_bready) s_bvalid <= 0;
         end
     end
-
-    // ============================================================
     // AXI Read
-    // ============================================================
+    
     always @(posedge clk or negedge rst_n) begin
         if (!rst_n) begin
             s_arready <= 0; s_rvalid <= 0; s_rdata <= 0; s_rresp <= 0;
