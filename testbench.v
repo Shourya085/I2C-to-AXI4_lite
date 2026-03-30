@@ -38,9 +38,6 @@ module i2c_to_axi4lite_tb;
     .scl(scl), .sda(sda)
   );
 
-  // ==========================================================
-  // I2C SLAVE (edge-driven)
-  // ==========================================================
   reg       slave_do_ack;
   reg [7:0] slave_tx_byte;
 
@@ -181,14 +178,11 @@ module i2c_to_axi4lite_tb;
     end
   end
 
-  // ==========================================================
-  // AXI TASKS (FIXED cpu_write)
-  // ==========================================================
   task cpu_write;
     input [4:0]  addr;
     input [31:0] data;
     begin
-      // ---------- AW channel ----------
+   
       @(posedge clk); #1;
       s_awaddr  = addr;
       s_awvalid = 1;
@@ -196,14 +190,13 @@ module i2c_to_axi4lite_tb;
       @(posedge clk); #1;
       s_awvalid = 0;
 
-      // ---------- W channel ----------
+    
       s_wdata  = data;
       s_wvalid = 1;
       while (!s_wready) @(posedge clk);
       @(posedge clk); #1;
       s_wvalid = 0;
 
-      // ---------- B channel ----------
       s_bready = 1;
       while (!s_bvalid) @(posedge clk);
       @(posedge clk); #1;
@@ -236,9 +229,6 @@ module i2c_to_axi4lite_tb;
     end
   endtask
 
-  // ==========================================================
-  // TESTS
-  // ==========================================================
   reg [31:0] rval;
 
   initial begin
@@ -252,10 +242,6 @@ module i2c_to_axi4lite_tb;
     tb_sda_drive=0;
     slave_do_ack=1;
     slave_tx_byte=8'h00;
-
-    $display("=========================================");
-    $display(" I2C to AXI4-Lite Bridge - Testbench");
-    $display("=========================================");
 
     repeat(20) @(posedge clk);
     rst_n=1;
