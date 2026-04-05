@@ -1,306 +1,308 @@
 `timescale 1ns / 1ps
 
+// I2C Slave to AXI4-Lite Master bridge
+
 module i2c_to_axi4lite #(
-    parameter CLK_FREQ = 100_000_000,
-    parameter I2C_FREQ = 100_000
+    parameter [6:0] I2C_ADDR = 7'h55
 )(
-    input  wire        clk,
-    input  wire        rst_n,
+    input  wire clk,
+    input  wire rst_n,
 
-    input  wire [4:0]  s_awaddr,
-    input  wire        s_awvalid,
-    output reg         s_awready,
+    // I2C
+    input  wire scl_i,
+    input  wire sda_i,
+    output reg  sda_o,
+    output reg  sda_oe,
 
-    input  wire [31:0] s_wdata,
-    input  wire        s_wvalid,
-    output reg         s_wready,
+    // AXI4-Lite
+    output reg  [15:0] m_axi_awaddr,
+    output reg         m_axi_awvalid,
+    input  wire        m_axi_awready,
+    output reg  [31:0] m_axi_wdata,
+    output reg  [3:0]  m_axi_wstrb,
+    output reg         m_axi_wvalid,
+    input  wire        m_axi_wready,
+    input  wire [1:0]  m_axi_bresp,
+    input  wire        m_axi_bvalid,
+    output reg         m_axi_bready,
 
-    output reg  [1:0]  s_bresp,
-    output reg         s_bvalid,
-    input  wire        s_bready,
+    output reg  [15:0] m_axi_araddr,
+    output reg         m_axi_arvalid,
+    input  wire        m_axi_arready,
+    input  wire [31:0] m_axi_rdata,
+    input  wire [1:0]  m_axi_rresp,
+    input  wire        m_axi_rvalid,
+    output reg         m_axi_rready,
 
-    input  wire [4:0]  s_araddr,
-    input  wire        s_arvalid,
-    output reg         s_arready,
-
-    output reg  [31:0] s_rdata,
-    output reg  [1:0]  s_rresp,
-    output reg         s_rvalid,
-    input  wire        s_rready,
-
-    output reg         scl,
-    inout  wire        sda
+    output reg busy,
+    output reg axi_error
 );
 
-    localparam integer HALF = CLK_FREQ / (I2C_FREQ * 2);
+    // ----------------------------------------------------
+    // sync I2C lines
+    reg [1:0] scl_ff, sda_ff;
 
-    // Config registers
-    reg [6:0]  reg_addr;
-    reg [23:0] reg_axia;
-    reg [7:0]  reg_wdata;
-    reg        reg_start, reg_rw;
-    reg        reg_busy, reg_done, reg_nack;
-    reg [7:0]  reg_rdata;
-
-    // SDA
-    reg sda_oe, sda_o;
-    assign sda = (sda_oe && !sda_o) ? 1'b0 : 1'bz;
-
-    // States
-    localparam [4:0]
-        IDLE     = 0,
-        START1   = 1,   // SDA SCL=1
-        START2   = 2,   // SCL, load byte
-        TX_LO    = 3,   // SCL=0, put bit on SDA
-        TX_HI    = 4,   // SCL=1, hold (slave samples)
-        TX_NEXT  = 5,   // SCL=1->0, advance to next bit or ACK
-        ACK_LO   = 6,   // SCL=0, release SDA
-        ACK_HI   = 7,   // SCL=1, sample ACK
-        ACK_NEXT = 8,   // SCL=1->0, decide what's next
-        RX_LO    = 9,   // SCL=0, slave drives SDA
-        RX_HI    = 10,  // SCL=1, sample bit
-        RX_NEXT  = 11,  // SCL=1->0, advance
-        NACK_LO  = 12,  // SCL=0, SDA=1
-        NACK_HI  = 13,  // SCL=1
-        STOP1    = 14,  // SCL=0, SDA=0
-        STOP2    = 15,  // SCL=1, SDA=0
-        STOP3    = 16,  // SDA = STOP
-        DONEST   = 17;
-
-    reg [4:0]  st;
-    reg [15:0] cnt;
-    reg        tick;
-    reg [3:0]  bidx;      // bit index 7..0
-    reg [7:0]  txr;       // TX shift register
-    reg [7:0]  rxr;       // RX shift register
-    reg        adone;     // address byte sent flag
-    reg        sda_sample; // latched SDA value
-
-    // Tick
     always @(posedge clk or negedge rst_n) begin
-        if (!rst_n) begin cnt <= 0; tick <= 0; end
-        else if (st == IDLE) begin cnt <= 0; tick <= 0; end
-        else begin
-            tick <= 0;
-            if (cnt == HALF - 1) begin cnt <= 0; tick <= 1; end
-            else cnt <= cnt + 1;
+        if (!rst_n) begin
+            scl_ff <= 2'b11;
+            sda_ff <= 2'b11;
+        end else begin
+            scl_ff <= {scl_ff[0], scl_i};
+            sda_ff <= {sda_ff[0], sda_i};
         end
     end
 
-    // FSM
+    wire scl = scl_ff[1];
+    wire sda = sda_ff[1];
+
+    // edge detect
+    reg scl_d, sda_d;
+
+    always @(posedge clk) begin
+        scl_d <= scl;
+        sda_d <= sda;
+    end
+
+    wire scl_rise =  scl & ~scl_d;
+    wire scl_fall = ~scl &  scl_d;
+
+    wire i2c_start = ~sda &  sda_d & scl;
+    wire i2c_stop  =  sda & ~sda_d & scl;
+
+    // ----------------------------------------------------
+    // registers
+
+    reg [2:0] rx_seq;
+
+    reg [7:0] rx_byte;
+    reg [7:0] addr_byte;
+    reg [7:0] axih_byte;
+    reg [7:0] axilo_byte;
+    reg [7:0] data_byte;
+
+    reg [2:0] bit_cnt;
+
+    reg [7:0] tx_byte;
+    reg [2:0] tx_cnt;
+
+    // ----------------------------------------------------
+    // states
+
+    localparam [3:0]
+        IDLE      = 4'd0,
+        RX        = 4'd1,
+        ACK       = 4'd2,
+        ACK_REL   = 4'd3,
+        AXI_WR    = 4'd4,
+        AXI_WR_W  = 4'd5,
+        AXI_RD    = 4'd6,
+        AXI_RD_W  = 4'd7,
+        TX        = 4'd8,
+        WAIT_NACK = 4'd9;
+
+    reg [3:0] state;
+
+    // ----------------------------------------------------
+    // main FSM
+
     always @(posedge clk or negedge rst_n) begin
         if (!rst_n) begin
-            st <= IDLE; scl <= 1; sda_o <= 1; sda_oe <= 0;
-            bidx <= 0; txr <= 0; rxr <= 0; adone <= 0;
-            reg_busy <= 0; reg_done <= 0; reg_nack <= 0; reg_rdata <= 0;
-            sda_sample <= 0;
+            state <= IDLE;
+            rx_seq <= 0;
+            rx_byte <= 0;
+            addr_byte <= 0;
+            axih_byte <= 0;
+            axilo_byte <= 0;
+            data_byte <= 0;
+            bit_cnt <= 7;
+            tx_byte <= 0;
+            tx_cnt <= 7;
+
+            sda_o <= 1;
+            sda_oe <= 0;
+
+            busy <= 0;
+            axi_error <= 0;
+
+            m_axi_awvalid <= 0;
+            m_axi_wvalid  <= 0;
+            m_axi_wstrb   <= 4'hF;
+            m_axi_bready  <= 0;
+            m_axi_arvalid <= 0;
+            m_axi_rready  <= 0;
+
         end else begin
-            case (st)
+
+            // STOP condition
+            if (i2c_stop) begin
+                state  <= IDLE;
+                sda_oe <= 0;
+                busy   <= 0;
+            end
+
+            // START or repeated START
+            else if (i2c_start) begin
+                state   <= RX;
+                rx_seq  <= 0;
+                rx_byte <= 0;
+                bit_cnt <= 7;
+                sda_oe  <= 0;
+                busy    <= 1;
+            end
+
+            else case (state)
 
                 IDLE: begin
-                    scl <= 1; sda_o <= 1; sda_oe <= 0; adone <= 0;
-                    if (reg_start) begin
-                        reg_busy <= 1; reg_done <= 0; reg_nack <= 0;
-                        st <= START1;
-                    end
+                    busy   <= 0;
+                    sda_oe <= 0;
                 end
 
-                // START 
-                START1: if (tick) begin
-                    scl <= 1; sda_o <= 0; sda_oe <= 1;  // SDA falls
-                    st <= START2;
-                end
+                // receive byte
+                RX: begin
+                    if (scl_rise) begin
+                        rx_byte <= {rx_byte[6:0], sda};
 
-                START2: if (tick) begin
-                    scl  <= 0;                           // SCL falls
-                    txr  <= {reg_addr, reg_rw};
-                    bidx <= 4'd7;
-                    adone <= 0;
-                    st   <= TX_LO;
-                end
+                        if (bit_cnt == 0) begin
+                            case (rx_seq)
+                                0: addr_byte  <= {rx_byte[6:0], sda};
+                                1: axih_byte  <= {rx_byte[6:0], sda};
+                                2: axilo_byte <= {rx_byte[6:0], sda};
+                                3: data_byte  <= {rx_byte[6:0], sda};
+                            endcase
 
-                // TRANSMIT BIT 
-                TX_LO: if (tick) begin
-                    scl    <= 0;
-                    sda_o  <= txr[7];
-                    sda_oe <= 1;
-                    st     <= TX_HI;
-                end
-
-                // TX_HI: Raise SCL. SDA is stable. Slave samples.
-                TX_HI: if (tick) begin
-                    scl <= 1;
-                    st  <= TX_NEXT;
-                end
-
-                // TX_NEXT: SCL has been high for one HALF. Now pull low.
-                TX_NEXT: if (tick) begin
-                    scl <= 0;
-                    if (bidx == 0) begin
-                        // All 8 bits sent,so go to ACK
-                        st <= ACK_LO;
-                    end else begin
-                        txr  <= {txr[6:0], 1'b0};
-                        bidx <= bidx - 1;
-                        st   <= TX_LO;
-                    end
-                end
-
-                // ---- ACK ----
-                ACK_LO: if (tick) begin
-                    scl    <= 0;
-                    sda_oe <= 0;  // release SDA
-                    st     <= ACK_HI;
-                end
-
-                ACK_HI: if (tick) begin
-                    scl <= 1;
-                    sda_sample <= sda;  // latch SDA
-                    st  <= ACK_NEXT;
-                end
-
-                ACK_NEXT: if (tick) begin
-                    scl <= 0;
-                    if (sda_sample == 1'b1) begin
-                        // NACK
-                        reg_nack <= 1;
-                        st <= STOP1;
-                    end else if (!adone) begin
-                        // Address ACK, so go to data
-                        adone <= 1;
-                        bidx  <= 4'd7;
-                        if (reg_rw) begin
-                            rxr <= 0;
-                            st  <= RX_LO;
+                            state   <= ACK;
+                            bit_cnt <= 7;
+                            rx_byte <= 0;
                         end else begin
-                            txr <= reg_wdata;
-                            st  <= TX_LO;
+                            bit_cnt <= bit_cnt - 1;
                         end
-                    end else begin
-                        // Data ACK, done
-                        st <= STOP1;
                     end
                 end
 
-                // RECEIVE BIT 
-                RX_LO: if (tick) begin
-                    scl    <= 0;
-                    sda_oe <= 0;
-                    st     <= RX_HI;
-                end
-
-                RX_HI: if (tick) begin
-                    scl <= 1;
-                    sda_sample <= sda;
-                    st  <= RX_NEXT;
-                end
-
-                RX_NEXT: if (tick) begin
-                    scl <= 0;
-                    rxr <= {rxr[6:0], sda_sample};
-                    if (bidx == 0) begin
-                        reg_rdata <= {rxr[6:0], sda_sample};
-                        st <= NACK_LO;
-                    end else begin
-                        bidx <= bidx - 1;
-                        st   <= RX_LO;
+                // send ACK
+                ACK: begin
+                    if (scl_fall) begin
+                        if (rx_seq == 0) begin
+                            if (addr_byte[7:1] == I2C_ADDR) begin
+                                sda_o  <= 0;
+                                sda_oe <= 1;
+                                state  <= ACK_REL;
+                            end else begin
+                                sda_oe <= 0;
+                                state  <= IDLE;
+                            end
+                        end else begin
+                            sda_o  <= 0;
+                            sda_oe <= 1;
+                            state  <= ACK_REL;
+                        end
                     end
                 end
 
-                // MASTER NACK 
-                NACK_LO: if (tick) begin
-                    scl    <= 0;
-                    sda_o  <= 1;   // NACK = high
-                    sda_oe <= 1;
-                    st     <= NACK_HI;
+                // release SDA after ACK
+                ACK_REL: begin
+                    if (scl_fall) begin
+                        sda_oe <= 0;
+
+                        case (rx_seq)
+                            0: begin
+                                if (addr_byte[0] == 0) begin
+                                    rx_seq <= 1;
+                                    state  <= RX;
+                                end else begin
+                                    state <= AXI_RD;
+                                end
+                            end
+
+                            1: begin
+                                rx_seq <= 2;
+                                state  <= RX;
+                            end
+
+                            2: begin
+                                rx_seq <= 3;
+                                state  <= RX;
+                            end
+
+                            3: begin
+                                state <= AXI_WR;
+                            end
+                        endcase
+                    end
                 end
 
-                NACK_HI: if (tick) begin
-                    scl <= 1;
-                    st  <= STOP1;
+                // AXI write
+                AXI_WR: begin
+                    m_axi_awaddr  <= {axih_byte, axilo_byte};
+                    m_axi_awvalid <= 1;
+                    m_axi_wdata   <= {24'd0, data_byte};
+                    m_axi_wvalid  <= 1;
+                    state         <= AXI_WR_W;
                 end
 
-                // STOP 
-                STOP1: if (tick) begin
-                    scl    <= 0;
-                    sda_o  <= 0;
-                    sda_oe <= 1;
-                    st     <= STOP2;
+                AXI_WR_W: begin
+                    if (m_axi_awready) m_axi_awvalid <= 0;
+                    if (m_axi_wready)  m_axi_wvalid  <= 0;
+
+                    if (m_axi_bvalid) begin
+                        m_axi_bready <= 1;
+                        axi_error    <= |m_axi_bresp;
+                        state        <= IDLE;
+                        busy         <= 0;
+                    end
+
+                    if (m_axi_bready)
+                        m_axi_bready <= 0;
                 end
 
-                STOP2: if (tick) begin
-                    scl <= 1;      // SCL rises, SDA still low
-                    st  <= STOP3;
+                // AXI read
+                AXI_RD: begin
+                    m_axi_araddr  <= {axih_byte, axilo_byte};
+                    m_axi_arvalid <= 1;
+                    m_axi_rready  <= 1;
+                    state         <= AXI_RD_W;
                 end
 
-                STOP3: if (tick) begin
-                    sda_o  <= 1;   // SDA rises = STOP
-                    sda_oe <= 0;
-                    st     <= DONEST;
+                AXI_RD_W: begin
+                    if (m_axi_arready)
+                        m_axi_arvalid <= 0;
+
+                    if (m_axi_rvalid) begin
+                        m_axi_rready <= 0;
+                        axi_error    <= |m_axi_rresp;
+                        tx_byte      <= m_axi_rdata[7:0];
+                        tx_cnt       <= 7;
+                        state        <= TX;
+                    end
                 end
 
-                DONEST: if (tick) begin
-                    reg_busy  <= 0;
-                    reg_done  <= 1;
-                    reg_start <= 0;
-                    st        <= IDLE;
+                // transmit byte
+                TX: begin
+                    if (scl_fall) begin
+                        sda_o  = tx_byte[7];
+                        sda_oe <= 1;
+
+                        if (tx_cnt == 0) begin
+                            state <= WAIT_NACK;
+                        end else begin
+                            tx_byte <= {tx_byte[6:0], 1'b0};
+                            tx_cnt  <= tx_cnt - 1;
+                        end
+                    end
                 end
 
-                default: st <= IDLE;
+                // wait for last clock, then release
+                WAIT_NACK: begin
+                    if (scl_fall) begin
+                        sda_oe <= 0;
+                        state  <= IDLE;
+                        busy   <= 0;
+                    end
+                end
+
+                default: state <= IDLE;
+
             endcase
-        end
-    end
-
-    // AXI Write
-
-    reg [4:0] awl;
-    always @(posedge clk or negedge rst_n) begin
-        if (!rst_n) begin
-            s_awready <= 0; s_wready <= 0; s_bvalid <= 0; s_bresp <= 0;
-            awl <= 0; reg_addr <= 0; reg_axia <= 0; reg_wdata <= 0;
-            reg_start <= 0; reg_rw <= 0;
-        end else begin
-            if (s_awvalid && !s_awready) begin
-                s_awready <= 1; awl <= s_awaddr;
-            end else s_awready <= 0;
-
-            if (s_wvalid && !s_wready) begin
-                s_wready <= 1;
-                case (awl[4:2])
-                    3'd0: reg_addr  <= s_wdata[6:0];
-                    3'd1: reg_axia  <= s_wdata[23:0];
-                    3'd2: reg_wdata <= s_wdata[7:0];
-                    3'd3: begin reg_start <= s_wdata[0]; reg_rw <= s_wdata[1]; end
-                    default: ;
-                endcase
-            end else s_wready <= 0;
-
-            if (s_wready && !s_bvalid) begin
-                s_bvalid <= 1; s_bresp <= 2'b00;
-            end else if (s_bvalid && s_bready) s_bvalid <= 0;
-        end
-    end
-    // AXI Read
-    
-    always @(posedge clk or negedge rst_n) begin
-        if (!rst_n) begin
-            s_arready <= 0; s_rvalid <= 0; s_rdata <= 0; s_rresp <= 0;
-        end else begin
-            if (s_arvalid && !s_arready) begin
-                s_arready <= 1; s_rvalid <= 1; s_rresp <= 2'b00;
-                case (s_araddr[4:2])
-                    3'd0: s_rdata <= {25'd0, reg_addr};
-                    3'd1: s_rdata <= {8'd0, reg_axia};
-                    3'd2: s_rdata <= {24'd0, reg_wdata};
-                    3'd3: s_rdata <= {30'd0, reg_rw, reg_start};
-                    3'd4: s_rdata <= {29'd0, reg_nack, reg_done, reg_busy};
-                    3'd5: s_rdata <= {24'd0, reg_rdata};
-                    default: s_rdata <= 32'd0;
-                endcase
-            end else begin
-                s_arready <= 0;
-                if (s_rvalid && s_rready) s_rvalid <= 0;
-            end
         end
     end
 
