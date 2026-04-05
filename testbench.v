@@ -1,6 +1,6 @@
 `timescale 1ns / 1ps
 
-// I2C Master + AXI4-Lite Slave TB
+// I2C Master to AXI4-Lite Slave tb
 
 module i2c_to_axi4lite_tb;
 
